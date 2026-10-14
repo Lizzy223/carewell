@@ -5,6 +5,7 @@ import { api, setToken, hasToken, MOCK } from './api.js'
 const STEPS = ['Find deceased', 'Cause of death', 'Registration details', 'My submissions']
 const BIRTH_STEPS = ['Birth details', 'My submissions']
 const PLACES = ['HOSPITAL', 'PHC', 'HOME', 'OTHER']
+const DUMMY_FACE = { image_base64: 'RkFLRS1GQUNF', liveness_passed: true } // placeholder avatar, no camera capture
 const BIRTH_PLACES = ['HOSPITAL', 'PHC', 'HOME', 'LGA']
 const Field = ({ label, children, hint }) => <label className="fld"><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>
 
@@ -191,50 +192,30 @@ function Track({ justDone, kind, onNew }) {
   )
 }
 
-function FaceCapture({ value, onChange }) {
-  const [stream, setStream] = useState(null); const [err, setErr] = useState(''); const [live, setLive] = useState(false)
-  const videoRef = el => { if (el && stream && el.srcObject !== stream) el.srcObject = stream }
-  useEffect(() => () => stream?.getTracks().forEach(t => t.stop()), [stream])
-  const start = async () => { setErr(''); try { setStream(await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } })) } catch { setErr('Camera unavailable. Allow camera access and try again.') } }
-  const snap = e => {
-    const v = e.currentTarget.closest('.face').querySelector('video'); const c = document.createElement('canvas')
-    c.width = v.videoWidth; c.height = v.videoHeight; c.getContext('2d').drawImage(v, 0, 0)
-    stream.getTracks().forEach(t => t.stop()); setStream(null); setLive(false)
-    onChange({ image_base64: c.toDataURL('image/jpeg', 0.85).split(',')[1], liveness_passed: false })
-  }
-  return (
-    <div className="face">
-      {stream && <video ref={videoRef} autoPlay playsInline muted style={{ width: '100%', maxWidth: 260, borderRadius: 8 }} />}
-      {value && !stream && <img alt="Captured face" src={`data:image/jpeg;base64,${value.image_base64}`} style={{ width: 120, borderRadius: 8 }} />}
-      <div className="row">
-        {stream ? <button type="button" className="btn btn-dark btn-sm" onClick={snap}>Capture</button>
-          : <button type="button" className="btn btn-outline btn-sm" onClick={start}>{value ? 'Retake photo' : 'Open camera'}</button>}
-      </div>
-      {value && <label className="fld"><span><input type="checkbox" checked={live} onChange={e => { setLive(e.target.checked); onChange({ ...value, liveness_passed: e.target.checked }) }} /> I confirm this parent/guardian was physically present and live for this capture.</span></label>}
-      {err && <p className="err">{err}</p>}
-    </div>
-  )
-}
-
 function BirthRegister({ onDone }) {
   const [centers, setCenters] = useState([])
   const [f, setF] = useState({ state_code: '', lga_code: '', ward: '', registration_center_id: '', geo_latitude: '', geo_longitude: '', hospital_notice_reference: '' })
   const [child, setChild] = useState({ first_name: '', last_name: '', date_of_birth: '', gender: 'F', place_of_birth: 'HOSPITAL', facility_id: '' })
-  const blank = () => ({ nin: '', relationship: 'MOTHER', first_name: '', last_name: '', face: null })
+  const blank = () => ({ nin: '', relationship: 'MOTHER', first_name: '', last_name: '', face: DUMMY_FACE, nimc: null, nimcErr: '', checking: false })
   const [parents, setParents] = useState([blank()])
   const [err, setErr] = useState(''); const [busy, setBusy] = useState(false)
   const set = k => e => setF({ ...f, [k]: e.target.value }); const setc = k => e => setChild({ ...child, [k]: e.target.value })
   const setp = (i, patch) => setParents(ps => ps.map((x, j) => j === i ? { ...x, ...patch } : x))
   const clean = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== '' && v != null))
+  const verifyNin = async (i, nin) => {
+    if (!/^\d{11}$/.test(nin)) return setp(i, { nimc: null, nimcErr: 'NIN must be 11 digits.' })
+    setp(i, { checking: true, nimcErr: '' })
+    try { const v = await api('POST', '/identity/verify-nin', { nin }); setp(i, { nimc: v, checking: false, first_name: v.first_name || '', last_name: v.last_name || '' }) }
+    catch (x) { setp(i, { nimc: null, checking: false, nimcErr: x.message }) }
+  }
   useEffect(() => { api('GET', `/centers${f.state_code ? `?state_code=${f.state_code}` : ''}`).then(setCenters).catch(() => {}) }, [f.state_code])
   const geo = () => navigator.geolocation?.getCurrentPosition(p => setF(x => ({ ...x, geo_latitude: p.coords.latitude, geo_longitude: p.coords.longitude })), () => setErr('Could not read your location. Enter coordinates manually.'))
   const submit = async e => {
     e.preventDefault(); setErr('')
-    if (parents.some(p => !p.face)) return setErr('Capture a face photo for each parent/guardian.')
-    if (parents.some(p => !p.face.liveness_passed)) return setErr('Confirm each parent/guardian was present for the live capture.')
+    if (parents.some(p => !p.nimc)) return setErr('Verify each parent/guardian NIN with NIMC before submitting.')
     setBusy(true)
     try {
-      const r = await api('POST', '/registrations/births', { ...clean(f), geo_latitude: +f.geo_latitude, geo_longitude: +f.geo_longitude, child: clean(child), parents: parents.map(clean) })
+      const r = await api('POST', '/registrations/births', { ...clean(f), geo_latitude: +f.geo_latitude, geo_longitude: +f.geo_longitude, child: clean(child), parents: parents.map(({ nimc, nimcErr, checking, ...x }) => clean(x)) })
       onDone(r)
     } catch (x) { setErr(x.message) } finally { setBusy(false) }
   }
@@ -254,12 +235,15 @@ function BirthRegister({ onDone }) {
       {parents.map((p, i) => (
         <div key={i} className="card p-card">
           <div className="grid2">
-            <Field label="NIN"><input required pattern="\d{11}" inputMode="numeric" maxLength={11} value={p.nin} onChange={e => setp(i, { nin: e.target.value })} /></Field>
+            <Field label="NIN"><input required pattern="\d{11}" inputMode="numeric" maxLength={11} value={p.nin} onChange={e => setp(i, { nin: e.target.value, nimc: null, nimcErr: '' })} onBlur={e => e.target.value && !p.nimc && verifyNin(i, e.target.value)} /></Field>
             <Field label="Relationship"><select value={p.relationship} onChange={e => setp(i, { relationship: e.target.value })}><option>MOTHER</option><option>FATHER</option><option>GUARDIAN</option></select></Field>
             <Field label="First name (optional)"><input maxLength={50} value={p.first_name} onChange={e => setp(i, { first_name: e.target.value })} /></Field>
             <Field label="Last name (optional)"><input maxLength={50} value={p.last_name} onChange={e => setp(i, { last_name: e.target.value })} /></Field>
           </div>
-          <FaceCapture value={p.face} onChange={face => setp(i, { face })} />
+          {p.checking && <p className="muted">Checking with NIMC…</p>}
+          {p.nimc && <p className="verified"><Icons.BadgeCheck size={18} /><span><b>{p.nimc.first_name} {p.nimc.last_name}</b> · NIMC verified</span></p>}
+          {p.nimcErr && <p className="err" role="alert">{p.nimcErr}</p>}
+          <p className="muted"><Icons.UserCircle size={28} style={{ verticalAlign: 'middle' }} /> Placeholder photo (demo): no face capture.</p>
           {parents.length > 1 && <button type="button" className="link" onClick={() => setParents(ps => ps.filter((_, j) => j !== i))}>Remove this parent/guardian</button>}
         </div>))}
       {parents.length < 2 && <button type="button" className="btn btn-outline btn-sm" onClick={() => setParents(ps => [...ps, { ...blank(), relationship: 'FATHER' }])}>Add second parent/guardian</button>}
